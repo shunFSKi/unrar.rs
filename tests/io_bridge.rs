@@ -13,7 +13,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use unrar_sys::io_bridge::{open_with_io, IoSource};
+use unrar_sys::io_bridge::{open_with_io, open_with_io_and_callback, IoSource};
 
 // unrar 进程级全局 ErrHandler（BRIDGE.md §6 上游固有约束）：同进程并发
 // 打开/读头会互相污染错误码——本文件全部用例经此锁串行执行。
@@ -273,4 +273,107 @@ fn non_archive_bytes_maps_to_bad_archive() {
     let garbage = vec![0u8; 1024]; // 无 RAR 签名
     let r = open_with_io(Arc::new(MemSource::new(garbage)), unrar_sys::RAR_OM_LIST);
     assert_eq!(r.unwrap_err(), unrar_sys::ERAR_BAD_ARCHIVE);
+}
+
+// ============================================================
+// 回调随打开注册（头加密容器依赖面）
+// ============================================================
+
+/// UCM_NEEDPASSWORD/W 密码回调（catch_unwind 铁律同款；user_data 携 &str）。
+extern "C" fn password_cb(
+    msg: unrar_sys::UINT,
+    user: unrar_sys::LPARAM,
+    p1: unrar_sys::LPARAM,
+    p2: unrar_sys::LPARAM,
+) -> std::os::raw::c_int {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if user == 0 {
+            return -1;
+        }
+        let pwd = unsafe { &*(user as *const &str) };
+        match msg {
+            unrar_sys::UCM_NEEDPASSWORDW => {
+                let chars: Vec<i32> = pwd.chars().map(|c| c as i32).collect();
+                if (p2 as usize) <= chars.len() {
+                    return -1; // 缓冲不足（含 NUL 位）。
+                }
+                let buf = p1 as *mut i32;
+                for (i, ch) in chars.iter().enumerate() {
+                    // SAFETY: 缓冲容量已校验 > 字符数。
+                    unsafe { buf.add(i).write(*ch) };
+                }
+                // SAFETY: 同上，结尾 NUL。
+                unsafe { buf.add(chars.len()).write(0) };
+                0
+            }
+            unrar_sys::UCM_NEEDPASSWORD => {
+                let b = pwd.as_bytes();
+                if (p2 as usize) <= b.len() {
+                    return -1;
+                }
+                let buf = p1 as *mut u8;
+                for (i, x) in b.iter().enumerate() {
+                    // SAFETY: 缓冲容量已校验 > 密码字节数。
+                    unsafe { buf.add(i).write(*x) };
+                }
+                // SAFETY: 同上，结尾 NUL。
+                unsafe { buf.add(b.len()).write(0) };
+                0
+            }
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// ⑤ 头加密容器（data/comment-hpw-password.rar，密码 "password"）：
+/// open 期回调在位 → 头解密成功，列目录收敛（主仓库「无凭据 open 即
+/// password_required」语义的依赖面：回调必须在 open 期注册）。
+#[test]
+fn head_encrypted_with_password_callback_lists_entries() {
+    let _guard = bridge_guard();
+    let data = std::fs::read("data/comment-hpw-password.rar").unwrap();
+    let pwd: &str = "password";
+    let arch = open_with_io_and_callback(
+        Arc::new(MemSource::new(data)),
+        unrar_sys::RAR_OM_LIST,
+        Some(password_cb),
+        &pwd as *const &str as unrar_sys::LPARAM,
+    )
+    .expect("open with password callback");
+    let mut count = 0;
+    loop {
+        let mut hd = unrar_sys::HeaderDataEx::default();
+        let code = unsafe { unrar_sys::RARReadHeaderEx(arch.handle(), &mut hd as *mut _) };
+        if code == unrar_sys::ERAR_END_ARCHIVE {
+            break;
+        }
+        assert_eq!(code, unrar_sys::ERAR_SUCCESS, "header error {code}");
+        count += 1;
+        let skip = unsafe {
+            unrar_sys::RARProcessFile(
+                arch.handle(),
+                unrar_sys::RAR_SKIP,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(skip, unrar_sys::ERAR_SUCCESS, "skip failed: {skip}");
+    }
+    assert!(count > 0, "head-encrypted listing must yield entries");
+}
+
+/// ⑥ 同容器 open 期无回调 → SilentOpen 跳过加密头处理（archive.cpp
+/// `Cmd->Callback==NULL → SilentOpen=true`），首个头读实测返回
+/// ERAR_MISSING_PASSWORD（22，CommandData DllError 通道；非 BAD_PASSWORD
+/// 24 的 throw 通道）——锁定「回调必须在 open 期在位」的边界语义。
+#[test]
+fn head_encrypted_without_callback_reports_bad_password_on_header() {
+    let _guard = bridge_guard();
+    let data = std::fs::read("data/comment-hpw-password.rar").unwrap();
+    let arch = open_with_io(Arc::new(MemSource::new(data)), unrar_sys::RAR_OM_LIST)
+        .expect("open succeeds (SilentOpen skips encrypted headers)");
+    let mut hd = unrar_sys::HeaderDataEx::default();
+    let code = unsafe { unrar_sys::RARReadHeaderEx(arch.handle(), &mut hd as *mut _) };
+    assert_eq!(code, unrar_sys::ERAR_MISSING_PASSWORD);
 }

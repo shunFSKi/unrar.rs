@@ -115,13 +115,18 @@ Close/析构      零改动自然兼容（hFile 恒为 BAD_HANDLE，
 
 FFI 面（no_std 兼容）：
 
-- `IoBridge` / `OpenArchiveDataEx2`（`#[repr(C)]` 镜像）+ `RAROpenArchiveEx2`
-  extern 声明。
+- `IoBridge` / `OpenArchiveDataEx2`（repr(C, packed) 镜像）+
+  `RAROpenArchiveEx2` extern 声明。
 
 std 门控安全封装（`io_bridge` 模块）：
 
 - `trait IoSource: Send + Sync { fn size(); fn read_at(offset, buf); }`；
 - `open_with_io(Arc<dyn IoSource>, open_mode) -> Result<IoArchive, ERAR 码>`；
+- `open_with_io_and_callback(…, callback, user_data)`：随打开注册 unrar 回调
+  （UCM_* 消息面）。**头加密容器要求回调在 open 期即在位**——vendor
+  archive.cpp IsArchive 的 `Cmd->Callback==NULL → SilentOpen=true` 会跳过加密
+  头处理，open 期无回调的实测边界 = 首个头读 ERAR_MISSING_PASSWORD（22，
+  tests/io_bridge.rs ⑤⑥ 两用例锁定正反两面）；
 - `IoArchive` 守卫：`handle()` 取裸句柄配 `RARReadHeaderEx`/`RARProcessFile`/
   `RARSetPassword` 等既有 extern 使用。
 

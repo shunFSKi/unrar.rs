@@ -16,11 +16,10 @@ use libc::{c_char, c_int, c_uchar, c_uint, c_void};
 #[cfg(windows)]
 mod env {
     pub use {
-        winapi::shared::minwindef::{LPARAM, UINT, UCHAR, INT},
+        winapi::shared::minwindef::{INT, LPARAM, UCHAR, UINT},
         winapi::shared::ntdef::LONG,
     };
 }
-
 
 #[cfg(not(windows))]
 mod env {
@@ -118,7 +117,8 @@ pub type IoSizeFn = extern "C" fn(user_data: *mut c_void) -> i64;
 
 /// 桥回调：从绝对 offset 定位读至多 len 字节进 buf，返回实际读取数
 /// （0=EOF，短读合法，<0=读错误）。
-pub type IoReadAtFn = extern "C" fn(user_data: *mut c_void, offset: u64, buf: *mut c_void, len: c_uint) -> i64;
+pub type IoReadAtFn =
+    extern "C" fn(user_data: *mut c_void, offset: u64, buf: *mut c_void, len: c_uint) -> i64;
 
 /// C 侧 `RARIOBridge` 的镜像（vendor/unrar/dll.hpp）。
 #[repr(C)]
@@ -142,7 +142,9 @@ pub type ProcessDataProc = extern "C" fn(*mut c_uchar, c_int) -> c_int;
 pub type Callback = extern "C" fn(UINT, LPARAM, LPARAM, LPARAM) -> c_int;
 
 #[repr(C)]
-pub struct Handle { _private: [u8; 0] }
+pub struct Handle {
+    _private: [u8; 0],
+}
 
 // ----------------- STRUCTS ----------------- //
 
@@ -240,7 +242,10 @@ pub struct OpenArchiveDataEx {
 // ----------------- BINDINGS ----------------- //
 
 #[link(name = "unrar", kind = "static")]
-#[cfg_attr(all(windows, target_env = "gnu"), link(name = "stdc++", kind = "static", modifiers = "-bundle"))]
+#[cfg_attr(
+    all(windows, target_env = "gnu"),
+    link(name = "stdc++", kind = "static", modifiers = "-bundle")
+)]
 #[cfg_attr(target_os = "macos", link(name = "c++"))]
 #[cfg_attr(any(target_os = "freebsd", target_os = "openbsd"), link(name = "c++"))]
 #[cfg_attr(any(target_os = "linux", target_os = "netbsd"), link(name = "stdc++"))]
@@ -288,10 +293,22 @@ impl OpenArchiveDataEx2 {
     /// 桥模式打开参数（fork 扩展）。`bridge` 指针须在 `RAROpenArchiveEx2`
     /// 返回前保持有效；来源对象生命周期见 [`io_bridge`] 模块说明。
     pub fn new(bridge: *const IoBridge, mode: c_uint) -> Self {
-        OpenArchiveDataEx2 {
-            base: OpenArchiveDataEx::new(std::ptr::null(), mode),
-            bridge,
-        }
+        Self::with_callback(bridge, mode, None, 0)
+    }
+
+    /// 同 [`OpenArchiveDataEx2::new`]，另随打开注册 unrar 回调（UCM_* 消息
+    /// 面）。头加密容器要求回调在 open 期即在位（vendor archive.cpp
+    /// IsArchive：`Cmd->Callback==NULL → SilentOpen=true` 会跳过加密头处理）。
+    pub fn with_callback(
+        bridge: *const IoBridge,
+        mode: c_uint,
+        callback: Option<Callback>,
+        user_data: LPARAM,
+    ) -> Self {
+        let mut base = OpenArchiveDataEx::new(std::ptr::null(), mode);
+        base.callback = callback;
+        base.user_data = user_data;
+        OpenArchiveDataEx2 { base, bridge }
     }
 }
 
@@ -490,24 +507,25 @@ pub mod io_bridge {
         buf: *mut c_void,
         len: c_uint,
     ) -> i64 {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<usize> {
-            let ctx = unsafe { &*(user_data as *const BridgeCtx) };
-            // 防御式钳制：unrar 单次请求上限为其内部缓冲（≤4MB），此处仅
-            // 保证 slice 构造合法，不改变语义。
-            let n = (len as usize).min(isize::MAX as usize);
-            let slice = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), n) };
-            let mut filled = 0usize;
-            while filled < slice.len() {
-                let k = ctx
-                    .src
-                    .read_at(offset + filled as u64, &mut slice[filled..])?;
-                if k == 0 {
-                    break; // EOF
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<usize> {
+                let ctx = unsafe { &*(user_data as *const BridgeCtx) };
+                // 防御式钳制：unrar 单次请求上限为其内部缓冲（≤4MB），此处仅
+                // 保证 slice 构造合法，不改变语义。
+                let n = (len as usize).min(isize::MAX as usize);
+                let slice = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), n) };
+                let mut filled = 0usize;
+                while filled < slice.len() {
+                    let k = ctx
+                        .src
+                        .read_at(offset + filled as u64, &mut slice[filled..])?;
+                    if k == 0 {
+                        break; // EOF
+                    }
+                    filled += k;
                 }
-                filled += k;
-            }
-            Ok(filled)
-        }));
+                Ok(filled)
+            }));
         match result {
             Ok(Ok(k)) => k.min(i64::MAX as usize) as i64,
             _ => -1, // panic 或宿主 Err → unrar 读错误链
@@ -553,26 +571,49 @@ pub mod io_bridge {
     /// 返回 `Err(open_result)`（`ERAR_*` 码）；注意 unrar 语义下坏档案以
     /// 「非 NULL 句柄 + open_result!=0」表达，此处已归一为 Err。
     pub fn open_with_io(src: Arc<dyn IoSource>, open_mode: c_uint) -> Result<IoArchive, c_int> {
-        let user_data = Box::into_raw(Box::new(BridgeCtx { src }));
+        open_with_io_and_callback(src, open_mode, None, 0)
+    }
+
+    /// 同 [`open_with_io`]，另随打开注册 unrar 回调（UCM_* 消息面：凭据
+    /// 询问/进度/换卷，宿主自管 `user_data` 生命周期）。
+    ///
+    /// 头加密容器要求回调在 open 期即在位：vendor archive.cpp IsArchive 的
+    /// `Cmd->Callback==NULL → SilentOpen=true` 会跳过加密头处理（凭据询问
+    /// 不再发生，语义退化为首个头读 ERAR_BAD_PASSWORD）。
+    pub fn open_with_io_and_callback(
+        src: Arc<dyn IoSource>,
+        open_mode: c_uint,
+        callback: Option<Callback>,
+        user_data: LPARAM,
+    ) -> Result<IoArchive, c_int> {
+        let bridge_ctx = Box::into_raw(Box::new(BridgeCtx { src }));
         let bridge = IoBridge {
-            user_data: user_data.cast(),
+            user_data: bridge_ctx.cast(),
             size: Some(size_trampoline),
             read_at: Some(read_at_trampoline),
         };
-        let mut data = OpenArchiveDataEx2::new(&bridge as *const IoBridge, open_mode);
+        let mut data = OpenArchiveDataEx2::with_callback(
+            &bridge as *const IoBridge,
+            open_mode,
+            callback,
+            user_data,
+        );
         let handle = unsafe { RAROpenArchiveEx2(&mut data as *mut _) };
         match NonNull::new(handle as *mut Handle) {
             // unrar 语义：IsArchive 失败仍返回非 NULL + open_result!=0，归一为 Err。
             Some(h) if data.base.open_result == ERAR_SUCCESS as c_uint => {
                 // 收回 Box 交给守卫持有（不重新构造 Arc——来源所有权闭合于守卫）。
-                let ctx = unsafe { Box::from_raw(user_data) };
-                Ok(IoArchive { handle: h, _ctx: ctx })
+                let ctx = unsafe { Box::from_raw(bridge_ctx) };
+                Ok(IoArchive {
+                    handle: h,
+                    _ctx: ctx,
+                })
             }
             _ => unsafe {
                 if !handle.is_null() {
                     RARCloseArchive(handle as *const _);
                 }
-                drop(Box::from_raw(user_data));
+                drop(Box::from_raw(bridge_ctx));
                 Err(if data.base.open_result == 0 {
                     ERAR_UNKNOWN
                 } else {
@@ -656,7 +697,10 @@ mod layout_tests {
         assert_eq!(std::mem::size_of::<IoBridge>(), 24);
         assert_eq!(std::mem::size_of::<OpenArchiveDataEx>(), 172);
         assert_eq!(std::mem::offset_of!(OpenArchiveDataEx, op_flags), 64);
-        assert_eq!(std::mem::offset_of!(OpenArchiveDataEx, comment_buffer_w), 68);
+        assert_eq!(
+            std::mem::offset_of!(OpenArchiveDataEx, comment_buffer_w),
+            68
+        );
         assert_eq!(std::mem::offset_of!(OpenArchiveDataEx, reserved), 72);
         assert_eq!(std::mem::size_of::<OpenArchiveDataEx2>(), 180);
         assert_eq!(std::mem::offset_of!(OpenArchiveDataEx2, bridge), 172);
