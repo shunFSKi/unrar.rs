@@ -1,6 +1,7 @@
 EXPORTS
   RAROpenArchive
   RAROpenArchiveEx
+  RAROpenArchiveEx2
   RARCloseArchive
   RARReadHeader
   RARReadHeaderEx

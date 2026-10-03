@@ -50,6 +50,10 @@ enum FILE_READ_ERROR_MODE {
   FREM_IGNORE        // Try to skip unreadable block and read further.
 };
 
+// IO 输入桥前置声明（定义在 dll.hpp，RARDLL 构建下经 rar.hpp 先行包含；
+// 见 dll.hpp 内注释与 unrar_sys/BRIDGE.md）。
+struct RARIOBridge;
+
 
 class File
 {
@@ -80,6 +84,14 @@ class File
     bool TruncatedAfterReadError;
 
     int64 CurFilePos; // Used for forward seeks in stdin files.
+
+    // ---- IO 桥模式（fork 扩展，见 unrar_sys/BRIDGE.md）----
+    // 非空 = 桥模式：本 File 不触碰磁盘，Read/Seek/Tell/FileLength 经宿主
+    // 回调（RARIOBridge）落到宿主随机读来源。指针不持有，生命周期由挂接方
+    // （dll.cpp 的 DataSet）保证与对象同生共死。仅档案本体 File 挂桥，
+    // 解压目标文件等其余 File 使用者保持默认 nullptr 磁盘行为。
+    RARIOBridge *Bridge;
+    int64 BridgePos; // 桥模式下的逻辑读位置（File 自持，回调按绝对偏移读）。
   protected:
     bool OpenShared; // Set by 'Archive' class.
   public:
@@ -120,8 +132,9 @@ class File
     static void StatToRarTime(struct stat &st,RarTime *ftm,RarTime *ftc,RarTime *fta);
 #endif
     void GetOpenFileTime(RarTime *ftm,RarTime *ftc=NULL,RarTime *fta=NULL);
-    virtual bool IsOpened() {return hFile!=FILE_BAD_HANDLE;} // 'virtual' for MultiFile class.
+    virtual bool IsOpened() {return Bridge!=nullptr || hFile!=FILE_BAD_HANDLE;} // 'virtual' for MultiFile class.
     virtual int64 FileLength(); // 'virtual' for MultiFile class.
+    void SetIOBridge(RARIOBridge *B) {Bridge=B;} // 非空进入桥模式（须在 Open 之前挂接）。
     void SetHandleType(FILE_HANDLETYPE Type) {HandleType=Type;}
     void SetLineInputMode(bool Mode) {LineInput=Mode;}
     FILE_HANDLETYPE GetHandleType() {return HandleType;}

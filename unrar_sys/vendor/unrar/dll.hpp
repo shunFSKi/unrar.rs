@@ -160,6 +160,44 @@ struct RAROpenArchiveDataEx
   unsigned int  Reserved[25];
 };
 
+// ========================================================================
+// IO 输入桥（本 fork 扩展，非 UnRAR 官方 ABI；设计说明见 unrar_sys/BRIDGE.md）
+//
+// 挂点选择：新增 RAROpenArchiveEx2 API + RAROpenArchiveDataEx2 结构，而不劫持
+// RAROpenArchiveDataEx 的 Reserved 保留区。理由：上游有征用保留区的前科
+// （RARHeaderDataEx 的 Redir* 字段即取自 Reserved，见 dll.cpp 对应注释），
+// 劫持保留区在上游合并时极易碰撞；新 API 使官方全部既有符号与结构零改动。
+//
+// 回调线程模型：unrar 在调用 RARReadHeaderEx/RARProcessFile 的同一线程内
+// 【同步】调用 Size/ReadAt（无内部线程）。宿主需保证两个回调可重入且线程安全。
+// ========================================================================
+
+// 输入回调桥：unrar 对档案的全部磁盘读（头链/数据区）收敛到 File 层后改经
+// 此二回调落到宿主提供的随机读来源，宿主无需整包副本。
+struct RARIOBridge
+{
+  // 宿主不透明指针，unrar 只透传不解引用（Rust 侧为 Box 装载的来源对象）。
+  // 生命周期：必须覆盖 RAROpenArchiveEx2 成功返回至 RARCloseArchive 返回全程。
+  void *UserData;
+
+  // 档案总字节数；返回 <0 视为读错误（unrar 上层转 ERAR_EREAD）。
+  // C++ 侧用 long long 而非 int64，保证 dll.hpp 可脱离 unrar 内部头独立包含。
+  long long (*Size)(void *UserData);
+
+  // 定位读：从绝对 Offset 起最多读 BufSize 字节进 Buf，返回实际读取数。
+  // 返回 0 = EOF；<0 = 读错误；短读合法（unrar 上层可处理短读）。
+  // Offset 保证 < Size()（unrar 不读越界位置；EOF 判定以返回 0 表达）。
+  long long (*ReadAt)(void *UserData,unsigned long long Offset,void *Buf,unsigned int BufSize);
+};
+
+// RAROpenArchiveDataEx 的桥模式扩展：Base 必须是第一成员。
+// Bridge 非空 = 桥模式（此时 ArcName 可为 NULL，宿主来源即档案本体）。
+struct RAROpenArchiveDataEx2
+{
+  struct RAROpenArchiveDataEx Base;
+  struct RARIOBridge *Bridge;
+};
+
 enum UNRARCALLBACK_MESSAGES {
   UCM_CHANGEVOLUME,UCM_PROCESSDATA,UCM_NEEDPASSWORD,UCM_CHANGEVOLUMEW,
   UCM_NEEDPASSWORDW,UCM_LARGEDICT
@@ -174,6 +212,12 @@ extern "C" {
 
 HANDLE PASCAL RAROpenArchive(struct RAROpenArchiveData *ArchiveData);
 HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *ArchiveData);
+
+// 桥模式打开（本 fork 扩展）：Bridge 非空时档案数据经回调供给，不触碰磁盘。
+// 返回与错误语义与 RAROpenArchiveEx 完全一致（注意 IsArchive 失败时返回
+// 非 NULL 句柄且 OpenResult!=0，调用方必须检查 OpenResult）。
+HANDLE PASCAL RAROpenArchiveEx2(struct RAROpenArchiveDataEx2 *ArchiveData);
+
 int    PASCAL RARCloseArchive(HANDLE hArcData);
 int    PASCAL RARReadHeader(HANDLE hArcData,struct RARHeaderData *HeaderData);
 int    PASCAL RARReadHeaderEx(HANDLE hArcData,struct RARHeaderDataEx *HeaderData);

@@ -19,6 +19,8 @@ File::File()
   ReadErrorMode=FREM_ASK;
   TruncatedAfterReadError=false;
   CurFilePos=0;
+  Bridge=nullptr;    // 桥模式默认关闭（fork 扩展，见 BRIDGE.md）
+  BridgePos=0;
 }
 
 
@@ -40,12 +42,28 @@ void File::operator = (File &SrcFile)
   HandleType=SrcFile.HandleType;
   TruncatedAfterReadError=SrcFile.TruncatedAfterReadError;
   FileName=SrcFile.FileName;
+  Bridge=SrcFile.Bridge;       // 桥状态随对象赋值透传，避免分流漂移
+  BridgePos=SrcFile.BridgePos;
   SrcFile.SkipClose=true;
 }
 
 
 bool File::Open(const std::wstring &Name,uint Mode)
 {
+  // ---- 桥模式：宿主来源已在打开前经 SetIOBridge 挂好，此处不触碰磁盘 ----
+  // hFile 保持 FILE_BAD_HANDLE，Close/析构的 fd 路径自然跳过；IsOpened 由
+  // Bridge 指针表达。打开本身不会失败（来源有效性由宿主与后续读保证）。
+  if (Bridge!=nullptr)
+  {
+    ErrorType=FILE_SUCCESS;
+    NewFile=false;
+    HandleType=FILE_HANDLENORMAL;
+    SkipClose=false;
+    FileName=Name;
+    BridgePos=0;
+    return true;
+  }
+
   ErrorType=FILE_SUCCESS;
   FileHandle hNewFile;
   bool OpenShared=File::OpenShared || (Mode & FMF_OPENSHARED)!=0;
@@ -446,6 +464,24 @@ int File::Read(void *Data,size_t Size)
 // Returns -1 in case of error.
 int File::DirectRead(void *Data,size_t Size)
 {
+  // ---- 桥模式：全部磁盘读的最终收敛点。按 File 自持逻辑位置定位读宿主
+  // 来源，读多少进多少。宿主错误（ReadAt<0，含 Rust 侧 panic 转译）不经
+  // FREM_ASK 交互链——DLL 进程无控制台语义，直接抛读错误，DLL 层 catch
+  // 转 ERAR_EREAD；AllowExceptions=false 时兜底返回 -1 走既有 -1 契约。
+  if (Bridge!=nullptr)
+  {
+    if (Size==0)
+      return 0;
+    long long ReadSize=Bridge->ReadAt(Bridge->UserData,(unsigned long long)BridgePos,Data,(unsigned int)Size);
+    if (ReadSize<0)
+    {
+      ErrHandler.ReadError(FileName);
+      return -1;
+    }
+    BridgePos+=ReadSize;
+    return (int)ReadSize;
+  }
+
 #ifdef _WIN_ALL
   const size_t MaxDeviceRead=20000;
   const size_t MaxLockedRead=32768;
@@ -519,6 +555,30 @@ void File::Seek(int64 Offset,int Method)
 
 bool File::RawSeek(int64 Offset,int Method)
 {
+  // ---- 桥模式：纯位置算术无 fd（hFile 保持 BAD_HANDLE，必须先于其后
+  // 的空句柄早退分支）。负偏移归一化与磁盘路径同构：SEEK_CUR/SEEK_END 的
+  // 负偏移先折算为绝对位置，越界（Target<0）返回 false → SeekError 链。
+  if (Bridge!=nullptr)
+  {
+    if (Offset<0 && Method!=SEEK_SET)
+    {
+      Offset=(Method==SEEK_CUR ? BridgePos:FileLength())+Offset;
+      Method=SEEK_SET;
+    }
+    int64 Target;
+    switch(Method)
+    {
+      case SEEK_SET: Target=Offset; break;
+      case SEEK_CUR: Target=BridgePos+Offset; break;
+      case SEEK_END: Target=FileLength()+Offset; break;
+      default: return false;
+    }
+    if (Target<0)
+      return false;
+    BridgePos=Target;
+    return true;
+  }
+
   if (hFile==FILE_BAD_HANDLE)
     return true;
   if (!IsSeekable()) // To extract archives from stdin with -si.
@@ -580,6 +640,10 @@ bool File::RawSeek(int64 Offset,int Method)
 
 int64 File::Tell()
 {
+  // ---- 桥模式：逻辑位置由 File 自持，不走 fd 查询。
+  if (Bridge!=nullptr)
+    return BridgePos;
+
   if (hFile==FILE_BAD_HANDLE)
     if (AllowExceptions)
       ErrHandler.SeekError(FileName);
@@ -777,6 +841,16 @@ void File::GetOpenFileTime(RarTime *ftm,RarTime *ftc,RarTime *fta)
 
 int64 File::FileLength()
 {
+  // ---- 桥模式：直接问宿主来源总长。Size()<0 抛读错误（RARX_READ，DLL 层
+  // catch 转 ERAR_EREAD），不返回负长度污染上层边界检查。
+  if (Bridge!=nullptr)
+  {
+    long long Size=Bridge->Size(Bridge->UserData);
+    if (Size<0)
+      ErrHandler.ReadError(FileName);
+    return Size;
+  }
+
   int64 SavePos=Tell();
   Seek(0,SEEK_END);
   int64 Length=Tell();

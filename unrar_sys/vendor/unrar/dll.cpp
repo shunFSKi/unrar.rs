@@ -10,6 +10,10 @@ struct DataSet
   int OpenMode;
   int HeaderSize;
 
+  // IO 桥模式（fork 扩展）：宿主回调结构的进程内副本。Arc 的 File 基类持有
+  // 指向本副本的指针，两者同属 DataSet、同生共死，悬垂风险由构造顺序消除。
+  RARIOBridge Bridge;
+
   DataSet():Arc(&Cmd),Extract(&Cmd) {};
 };
 
@@ -30,7 +34,9 @@ HANDLE PASCAL RAROpenArchive(struct RAROpenArchiveData *r)
 }
 
 
-HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
+// 打开共用主体（fork 改造）：RAROpenArchiveEx 与桥模式 RAROpenArchiveEx2
+// 共用。Bridge 为 nullptr 即官方既有路径，行为零变化。
+static HANDLE OpenArchiveInternal(struct RAROpenArchiveDataEx *r,struct RARIOBridge *Bridge)
 {
   DataSet *Data=NULL;
   try
@@ -43,6 +49,13 @@ HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
     Data->OpenMode=r->OpenMode;
     Data->Cmd.FileArgs.AddString(L"*");
     Data->Cmd.KeepBroken=(r->OpFlags&ROADOF_KEEPBROKEN)!=0;
+
+    // 桥模式：副本宿主回调表并挂到 Archive 的 File 基类（须在 Open 之前）。
+    if (Bridge!=nullptr)
+    {
+      Data->Bridge=*Bridge;
+      Data->Arc.SetIOBridge(&Data->Bridge);
+    }
 
     std::string AnsiArcName;
     if (r->ArcName!=nullptr)
@@ -160,6 +173,27 @@ HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
       delete Data;
   }
   return NULL; // To make compilers happy.
+}
+
+
+HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
+{
+  return OpenArchiveInternal(r,nullptr);
+}
+
+
+// 桥模式打开（fork 扩展，结构语义见 dll.hpp RAROpenArchiveDataEx2 注释）。
+HANDLE PASCAL RAROpenArchiveEx2(struct RAROpenArchiveDataEx2 *r)
+{
+  if (r==nullptr)
+    return nullptr;
+  // 宿主回调表不完整：无法供给数据，按打开失败处理，绝不解引用空槽。
+  if (r->Bridge!=nullptr && (r->Bridge->Size==nullptr || r->Bridge->ReadAt==nullptr))
+  {
+    r->Base.OpenResult=ERAR_UNKNOWN;
+    return nullptr;
+  }
+  return OpenArchiveInternal(&r->Base,r->Bridge);
 }
 
 
