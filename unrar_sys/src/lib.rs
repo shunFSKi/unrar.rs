@@ -216,11 +216,12 @@ pub struct OpenArchiveData {
 }
 
 // ABI 对齐注记（fork 修正）：vendor dll.hpp 整体处于 `#pragma pack(1)` 之下，
-// C 侧 RAROpenArchiveDataEx 实际 172 字节——指针字段存在非 8 对齐偏移
-// （CmtBufW@68）。`#[repr(C)]` 的自然对齐会把本结构膨胀为 184 字节，与其后
-// 追加的字段全部错位；上游旧声明因消费面都在偏移 68 之前而侥幸可用，桥模式
-// 需要在结构之后扩展字段，必须逐字节对齐。repr(C, packed) 与 pack(1) 同构
-// （禁对字段取引用，本 crate 全部按值读写）。
+// C 侧 RAROpenArchiveDataEx 实际 176 字节——指针字段存在非 8 对齐偏移
+// （CmtBufW@68..76）。`#[repr(C)]` 的自然对齐会把本结构膨胀为 184 字节，与
+// 其后追加的字段全部错位（C 侧在偏移 176 读扩展字段，repr(C) 布局读到
+// reserved 尾部与对齐填充）；上游旧声明因消费面都在偏移 68 之前而侥幸可用，
+// 桥模式需要在结构之后扩展字段，必须逐字节对齐。repr(C, packed) 与 pack(1)
+// 同构（禁对字段取引用，本 crate 全部按值读写）。
 #[repr(C, packed)]
 pub struct OpenArchiveDataEx {
     pub archive_name: *const c_char,
@@ -689,21 +690,23 @@ mod layout_tests {
     use super::*;
 
     // pack(1) 契约锁定（LP64 主机）：Rust 镜像与 vendor dll.hpp 逐字节对齐。
+    // 基准值经 C 侧实算铁证（cc 编译 offsetof/sizeof 直测）：Ex=176
+    // （OpFlags@64、CmtBufW@68..76、Reserved@76）、Ex2=184、Bridge@176。
     // 防回归点：repr(C) 自然对齐会膨胀 OpenArchiveDataEx 至 184 字节并使其后
-    // 扩展字段全部错位（桥模式曾因此读到 NULL Bridge）——本测试常驻拦截。
+    // 扩展字段全部错位（桥模式首验曾因此读到 NULL Bridge）——本测试常驻拦截。
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn open_archive_data_mirrors_packed_c_layout() {
         assert_eq!(std::mem::size_of::<IoBridge>(), 24);
-        assert_eq!(std::mem::size_of::<OpenArchiveDataEx>(), 172);
+        assert_eq!(std::mem::size_of::<OpenArchiveDataEx>(), 176);
         assert_eq!(std::mem::offset_of!(OpenArchiveDataEx, op_flags), 64);
         assert_eq!(
             std::mem::offset_of!(OpenArchiveDataEx, comment_buffer_w),
             68
         );
-        assert_eq!(std::mem::offset_of!(OpenArchiveDataEx, reserved), 72);
-        assert_eq!(std::mem::size_of::<OpenArchiveDataEx2>(), 180);
-        assert_eq!(std::mem::offset_of!(OpenArchiveDataEx2, bridge), 172);
+        assert_eq!(std::mem::offset_of!(OpenArchiveDataEx, reserved), 76);
+        assert_eq!(std::mem::size_of::<OpenArchiveDataEx2>(), 184);
+        assert_eq!(std::mem::offset_of!(OpenArchiveDataEx2, bridge), 176);
     }
 }
 

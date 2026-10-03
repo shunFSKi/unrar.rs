@@ -149,12 +149,15 @@ unrar 在调用 `RARReadHeaderEx`/`RARProcessFile` 的**同一线程**同步触�
 「每次 1 字节」用例锁此契约。
 
 **ABI 对齐（实施期发现并修正）**：vendor `dll.hpp` 整体处于 `#pragma pack(1)`
-之下，C 侧 `RAROpenArchiveDataEx` 实际 172 字节且指针字段存在非对齐偏移
-（`CmtBufW`@68）；上游 Rust 镜像 `#[repr(C)]` 自然对齐膨胀为 184 字节——
+之下，C 侧 `RAROpenArchiveDataEx` 实际 176 字节且指针字段存在非对齐偏移
+（`CmtBufW`@68..76）；上游 Rust 镜像 `#[repr(C)]` 自然对齐膨胀为 184 字节——
 上游因消费字段全在偏移 68 之前而侥幸可用，桥契约在结构之后扩展字段则必然
-错位（首验实证：C 在偏移 172 读 `Bridge` 落进 reserved 区读到 NULL）。修正：
+错位（首验实证：C 在偏移 176 读 `Bridge` 落进 reserved 尾部与填充区读到
+NULL；布局基准经 cc offsetof/sizeof 实算铁证）。修正：
 `OpenArchiveDataEx`/`OpenArchiveDataEx2` 改 `#[repr(C, packed)]`，并以
-`layout_tests::open_archive_data_mirrors_packed_c_layout` 常驻锁定。
+`layout_tests::open_archive_data_mirrors_packed_c_layout` 常驻锁定（断言
+基准 = cc 实算：176/76/184/176；初版手算 172/72/180/172 误将 `wchar_t*`
+按 4 字节收尾，2026-10-03 验收核查勘误）。
 **同源漂移登记未修**：上游 Rust `HeaderDataEx`（reserved 988 vs C 982 +
 ArcNameEx/FileNameEx 族）同样在 `comment_buffer`@5164 处开始错位——上游
 消费面（文件名/标志/尺寸）恰在漂移点之前故未暴露；K8.2 若需消费
@@ -195,9 +198,9 @@ vendor/unrar/dll_nocrypt.def 增补导出
 src/lib.rs                  FFI 镜像 + io_bridge 安全封装模块
                             + OpenArchiveDataEx(2) repr(C,packed) 修正
                             + trampoline 单测 + 布局锁定测试
-tests/io_bridge.rs          最小验证六例：内存列目录（交叉路径模式）、
+tests/io_bridge.rs          最小验证八例：内存列目录（交叉路径模式）、
                             解压全链、1 字节短读、宿主 Err/panic、
-                            非档案字节
+                            非档案字节、头加密回调正反面
 ====================================================================
 ```
 
